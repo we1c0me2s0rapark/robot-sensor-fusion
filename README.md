@@ -27,6 +27,100 @@ robot-sensor-fusion/
 └── requirements.txt
 ```
 
+## Execution flow
+``` mermaid
+---
+config:
+  layout: elk
+---
+
+flowchart LR
+    subgraph ref["<b>Reference</b>"]
+    direction LR
+        ModuleRunBench["run_benchmark()"]
+            -.-> sources
+        ModuleRunSim["run_simulation()"]
+            -.-> sources
+
+        subgraph sources["<b>Sources</b>"]
+        direction TD
+            Robot
+            EKF
+            State
+
+            Robot -.-> State
+            EKF -.-> State
+        end
+    end
+
+    subgraph body[" "]
+        main["<b>main()</b>"]
+        runBench["<b>run_benchmark()</b>"]
+        benchArg{"<b>--benchmark</b> flag
+    given?"}
+        cheapOrAll{"<b>scenario 1: cheap or all</b>
+    given?"}
+        fusionOrAll{"<b>scenario 2: fusion or all</b>
+    given?"}
+        runSimHighQual["<b>run_simulation()</b>
+    high quality IMU
+    + odometry"]
+        runSimCheap["<b>run_simulation()</b>
+    cheap IMU
+    + odometry"]
+        plotResults1["<b>plot_scenario()</b>"]
+        runSimCheapQual["<b>run_simulation()</b>
+    cheap quality IMU
+    + odometry"]
+        runSimCheapOnly["<b>run_simulation()</b>
+    cheap IMU"]
+        plotResults2["<b>plot_scenario()</b>"]
+        terminate["<b>Terminate</b>"]
+        
+        main --> runBench
+        runBench --> benchArg
+        
+        benchArg -->|Yes| terminate
+        benchArg -->|No| cheapOrAll
+
+        subgraph scenarios["<b>Scenarios</b>"]
+
+            subgraph s1["<b>Group 1: IMU Quality Comparison</b>"]
+                cheapOrAll -->|Yes| runSimHighQual
+                runSimHighQual --> runSimCheap
+                runSimCheap --> plotResults1
+            end
+
+            subgraph s2["<b>Group 2: Fusion Comparison</b>"]
+                fusionOrAll -->|Yes| runSimCheapQual
+                runSimCheapQual --> runSimCheapOnly
+                runSimCheapOnly --> plotResults2
+            end
+
+        end
+
+        scenarios --> terminate
+    end
+
+    classDef decision fill:#f5f3ff,stroke:#a78bfa,color:#5b21b6
+    classDef process fill:#f0f9ff,stroke:#38bdf8,color:#0369a1
+    classDef endpoint fill:#fef2f2,stroke:#f87171,color:#b91c1c
+    classDef source fill:#f0fdf4,stroke:#16a34a,color:#14532d
+    classDef scenarioGroup fill:#fff7ed,stroke:#f97316,color:#7c2d12,stroke-width:2px
+
+    class benchArg,cheapOrAll,fusionOrAll decision
+    class runBench,runSimHighQual,runSimCheap,runSimCheapQual,runSimCheapOnly,ModuleRunBench,ModuleRunSim,plotResults1,plotResults2 process
+    class main,terminate endpoint
+    class Robot,EKF,State source
+    class s1 scenarioGroup
+    class s2 scenarioGroup
+
+    style scenarios fill:#f8fafc,stroke:#94a3b8,color:#1e293b
+    style sources fill:#f0fdf4,stroke:#16a34a,color:#14532d
+    style ref fill:#f8fafc,stroke:#94a3b8,color:#713f12
+    style body fill:transparent,stroke:transparent
+```
+
 ## Running the demos
 
 ```bash
@@ -66,26 +160,33 @@ x = [px, py, theta, v, omega]
 
 ### Algorithm: Extended Kalman Filter
 
-An EKF was chosen over a UKF or particle filter for three reasons:
+An Extended Kalman Filter (EKF) is used for nonlinear state estimation.
 
-1. **Speed.** At 1 kHz the predict step must complete in under 1 ms.
-   The analytic 5x5 Jacobian in the EKF adds negligible cost on top of
-   the matrix multiply.  Typical measured cost: ~5 µs per call.
+Why EKF is used
+1. **Computational efficiency**
+   The system must operate at 1 kHz. The EKF predict step is lightweight and avoids sampling based methods.
 
-2. **The nonlinearity is mild.** The unicycle model has a single
-   trigonometric nonlinearity (heading coupling into x/y).  A first-order
-   Taylor expansion (EKF) handles this well.
+2. **Moderate nonlinearity**
+   The unicycle motion model introduces a single trigonometric coupling between heading and position, which is well handled by first order linearisation.
 
-3. **Commercial-friendliness.** No GPL dependencies -- pure NumPy.
+3. **Low dimensional state**
+   The state is five dimensional, making EKF sufficient compared to UKF or particle filters.
+
+4. **Commercial suitability**
+   The implementation uses only NumPy and standard Python libraries.
 
 ### Sensor models
 
-**IMUSensor** (`sensors.py`)
+**IMUSensor** (`IMUSensor`)
+The IMU model includes Gaussian noise and bias drift.
 
 Noise model:
-
 ```
 measurement = true_value + N(0, noise_std) + bias
+```
+
+Bias evolves as a discrete time random walk:
+```
 bias(t+dt)  = bias(t) + N(0, bias_drift * sqrt(dt))
 ```
 
@@ -94,10 +195,11 @@ bias(t+dt)  = bias(t) + N(0, bias_drift * sqrt(dt))
 | High-quality  | 0.001 rad/s    | 0.00001 rad/s/s |
 | Cheap         | 0.05 rad/s     | 0.01 rad/s/s    |
 
-**WheelOdometrySensor** (`sensors.py`)
+The IMU provides high frequency angular velocity and linear acceleration measurements used in the EKF prediction step. The angular velocity is used directly in the motion model, while linear acceleration is projected onto the robot heading to update linear velocity.
 
-Adds Gaussian noise to each wheel velocity independently.
-Optional slip events (configurable probability) zero out one wheel.
+**WheelOdometrySensor** (`WheelOdometrySensor`)
+
+The odometry model simulates a differential drive system by converting wheel velocities into linear and angular velocity estimates. Gaussian noise is added independently to each wheel. Optional slip events can randomly zero one wheel to simulate wheel loss of traction.
 
 ### Predict vs update rates
 
@@ -106,18 +208,13 @@ Optional slip events (configurable probability) zero out one wheel.
 | predict | IMU reading    | 1 kHz        |
 | update  | Odometry tick  | 50 Hz        |
 
-The predict step propagates both the state and covariance using the
-IMU as a control input.  The update step corrects accumulated IMU drift
-using the wheel-odometry estimate of [v, omega].
+The prediction step propagates state and covariance using high frequency IMU measurements. The update step corrects drift using wheel odometry.
 
 ### Performance
 
-All EKF matrices are pre-allocated at construction time.
-No heap allocation occurs in `predict()` or `update_odometry()`.
-The 2x2 innovation covariance inversion in the update step uses the
-explicit analytic inverse rather than `np.linalg.inv`.
+All matrices are preallocated during initialisation to reduce overhead in the real time loop. The update step uses an explicit analytic inverse for the 2x2 innovation covariance matrix instead of a general matrix inversion.
 
-Typical measured throughput on a standard laptop CPU:
+Typical measured performance on a modern laptop (results are hardware dependent and may vary with Python build):
 
 | Operation | Time     |
 |-----------|----------|
