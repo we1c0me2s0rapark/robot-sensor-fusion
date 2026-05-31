@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from src.robot import Robot
 from src.sensors import IMUSensor, WheelOdometrySensor
 from src.ekf import EKF
+from src.state import StateIdx, STATE_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +216,11 @@ def run_simulation(
             result.times.append(t)
             result.true_x.append(robot.x)
             result.true_y.append(robot.y)
-            result.est_x.append(est[0])
-            result.est_y.append(est[1])
+            result.est_x.append(est[StateIdx.PX])
+            result.est_y.append(est[StateIdx.PY])
 
-            pos_err = np.hypot(robot.x - est[0], robot.y - est[1])
-            vel_err = abs(robot.v - est[3])
+            pos_err = np.hypot(robot.x - est[StateIdx.PX], robot.y - est[StateIdx.PY])
+            vel_err = abs(robot.v - est[StateIdx.V])
 
             result.pos_error.append(pos_err)
             result.vel_error.append(vel_err)
@@ -240,10 +241,11 @@ def run_benchmark(sim_cfg: SimConfig) -> None:
     """
     print("\n--- Performance Benchmark ---")
 
+    # Use a fixed random seed for reproducibility
     rng = np.random.default_rng(sim_cfg.seed)
 
     robot = Robot()
-    robot.set_velocity(1.0, 0.3)
+    robot.set_velocity(1.0, 0.3)  # Expose state index enum for direct access
 
     imu = IMUSensor(rng=rng)
     odom = WheelOdometrySensor(rng=rng)
@@ -367,6 +369,8 @@ def main(argv: list[str] | None = None) -> None:
         "--benchmark", action="store_true",
         help="Run only the performance benchmark",
     )
+    # cheap: compare high-quality vs cheap IMU (both with odometry)
+    # fusion: compare full fusion vs IMU-only (using cheap IMU)
     parser.add_argument(
         "--scenario", choices=["cheap", "fusion", "all"], default="all",
         help="Which scenario to run (default: all)",

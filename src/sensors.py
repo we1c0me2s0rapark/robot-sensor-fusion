@@ -52,14 +52,19 @@ class IMUSensor:
         @param gyro_bias_drift Standard deviation of gyroscope bias drift per sqrt(dt)
         @param rng Optional random number generator for reproducibility
         """
+        # White noise parameters
         self.accel_noise_std = accel_noise_std
         self.gyro_noise_std = gyro_noise_std
+
+        # Bias drift parameters; slowly evolving bias modeled as a random walk
         self.accel_bias_drift = accel_bias_drift
         self.gyro_bias_drift = gyro_bias_drift
+
+        # Random number generator for noise and bias drift
         self._rng = rng or np.random.default_rng()
 
         # Persistent biases (start at zero, drift over time)
-        self._accel_bias = np.zeros(2, dtype=np.float64)
+        self._accel_bias = np.zeros(2, dtype=np.float64) # [bias_ax, bias_ay]
         self._gyro_bias = 0.0
 
     def reset(self) -> None:
@@ -81,29 +86,62 @@ class IMUSensor:
             - omega: angular velocity in rad/s
         """
 
-        # True linear acceleration in the world frame
-        # Compute acceleration from time derivative of velocity in the unicycle model
+        # True linear acceleration in the world frame for a unicycle model
+        #
+        # Assumptions:
+        # - Linear speed v is constant over the timestep
+        # - Angular velocity omega is constant over the timestep
+        # - Heading evolves as: theta_dot = omega
+        #
+        # Velocity in world frame:
+        #   v_x = v * cos(theta)
+        #   v_y = v * sin(theta)
+        #
+        # Acceleration is the time derivative of velocity:
+        # (only theta changes with time, v is constant)
+        #
+        #   a_x = d/dt (v * cos(theta)) = -v * omega * sin(theta)
+        #   a_y = d/dt (v * sin(theta)) =  v * omega * cos(theta)
+        #
+        # Geometric interpretation:
+        # - Velocity is tangent to the motion
+        # - Acceleration is perpendicular to velocity (90° rotation)
+        # - This is purely centripetal acceleration (no change in speed)
+        # - Direction corresponds to rotation of velocity vector by sign of omega
+        #
+        # Magnitude:
+        #   |a| = v * omega
         v, omega, theta = robot.v, robot.omega, robot.theta
+
         true_ax = -v * omega * np.sin(theta)
         true_ay = v * omega * np.cos(theta)
+
         true_omega = omega
 
         # Update bias using Gaussian noise scaled by sqrt(dt) (random walk model)
+        mean = 0.0
         sqrt_dt = np.sqrt(dt)
-        self._accel_bias += (
-            self._rng.normal(0.0, self.accel_bias_drift * sqrt_dt, size=2)
-        )
-        self._gyro_bias += self._rng.normal(
-            0.0, self.gyro_bias_drift * sqrt_dt
-        )
 
-        # Add white noise and bias
+        # Add white noise and bias to acceleration
         accel = np.array([true_ax, true_ay], dtype=np.float64)
-        accel += self._rng.normal(0.0, self.accel_noise_std, size=2)
-        accel += self._accel_bias
 
+        # 1. Add zero-mean Gaussian white noise (uncorrelated in time)
+        accel += self._rng.normal(mean, self.accel_noise_std, size=2)
+
+        # 2. Add bias (slowly varying offset that introduces temporal correlation)
+        accel_bias_std = self.accel_bias_drift * sqrt_dt
+        self._accel_bias += (self._rng.normal(mean, accel_bias_std, size=2))
+        accel += self._accel_bias
+        
+        # Add white noise and bias to angular velocity
         meas_omega = true_omega
-        meas_omega += self._rng.normal(0.0, self.gyro_noise_std)
+        
+        # 1. Add zero-mean Gaussian white noise (uncorrelated in time)
+        meas_omega += self._rng.normal(mean, self.gyro_noise_std)
+        
+        # 2. Add bias (slowly varying offset that introduces temporal correlation)
+        gyro_bias_std = self.gyro_bias_drift * sqrt_dt
+        self._gyro_bias += self._rng.normal(mean, gyro_bias_std)
         meas_omega += self._gyro_bias
 
         return {"accel": accel, "omega": float(meas_omega)}
@@ -111,13 +149,15 @@ class IMUSensor:
 
 class WheelOdometrySensor:
     """
-    @brief Differential drive wheel odometry sensor model.
+    @brief Differential drive wheel odometry sensor model
 
     @details
-    This sensor simulates wheel encoder measurements including:
-    - Gaussian measurement noise
-    - Optional wheel slip events
-    - Conversion from wheel velocities to linear and angular velocity
+    This model simulates wheel encoder measurements for a differential drive robot.
+
+    It includes:
+    - Conversion between unicycle velocities and wheel angular velocities
+    - Gaussian encoder noise
+    - Optional stochastic wheel slip events
     """
 
     def __init__(
@@ -128,12 +168,12 @@ class WheelOdometrySensor:
         rng: np.random.Generator | None = None,
     ) -> None:
         """
-        @brief Initialise wheel odometry sensor.
+        @brief Initialise wheel odometry sensor
 
-        @param wheel_base Distance between left and right wheels in metres
-        @param noise_std Standard deviation of wheel velocity noise
-        @param slip_probability Probability of a wheel slip event per reading
-        @param rng Optional random number generator for reproducibility
+        @param wheel_base Distance between left and right wheels (m)
+        @param noise_std Standard deviation of encoder velocity noise (m/s)
+        @param slip_probability Probability of a wheel slip event per update
+        @param rng Random number generator for reproducibility
         """
         self.wheel_base = wheel_base
         self.noise_std = noise_std
@@ -142,20 +182,30 @@ class WheelOdometrySensor:
 
     def read(self, robot: Robot) -> dict[str, float]:
         """
-        @brief Sample wheel encoder-based odometry.
+        @brief Generate noisy wheel odometry measurements from ground truth
 
-        @param robot Ground-truth robot instance
+        @param robot Ground-truth robot state source
 
         @return Dictionary containing:
-            - v_left: left wheel velocity (m/s)
-            - v_right: right wheel velocity (m/s)
-            - v: estimated linear velocity (m/s)
-            - omega: estimated angular velocity (rad/s)
+            - v_left: left wheel linear velocity (m/s)
+            - v_right: right wheel linear velocity (m/s)
+            - v: reconstructed linear velocity estimate (m/s)
+            - omega: reconstructed angular velocity estimate (rad/s)
         """
+
         v, omega = robot.v, robot.omega
         half_base = self.wheel_base / 2.0
 
-        # Compute left and right wheel velocities from unicycle kinematics
+        # -----------------------------------------------------------------
+        # Forward kinematics: unicycle -> differential drive wheels
+        #
+        # v_left  = v - (omega * L/2)
+        # v_right = v + (omega * L/2)
+        #
+        # Interpretation:
+        # - omega > 0 → right wheel faster than left wheel (left turn)
+        # - omega < 0 → left wheel faster than right wheel (right turn)
+        # -----------------------------------------------------------------
         v_left = v - omega * half_base
         v_right = v + omega * half_base
 
@@ -163,7 +213,13 @@ class WheelOdometrySensor:
         v_left += self._rng.normal(0.0, self.noise_std)
         v_right += self._rng.normal(0.0, self.noise_std)
 
-        # Simulate occasional asymmetric wheel slip event
+        # -----------------------------------------------------------------
+        # Optional wheel slip model
+        #
+        # With probability slip_probability:
+        # - one wheel temporarily loses traction and reports zero velocity
+        # - introduces strong asymmetry and odometry error
+        # -----------------------------------------------------------------
         if self.slip_probability > 0.0:
             if self._rng.random() < self.slip_probability:
                 if self._rng.random() < 0.5:
@@ -171,7 +227,16 @@ class WheelOdometrySensor:
                 else:
                     v_right = 0.0
 
-        # Convert wheel measurements back to unicycle velocity estimates
+        # -----------------------------------------------------------------
+        # Inverse kinematics: differential drive wheels -> unicycle
+        #
+        # v = (v_right + v_left) / 2
+        # omega = (v_right - v_left) / L
+        #
+        # Interpretation:
+        # - positive omega → robot turns left
+        # - negative omega → robot turns right
+        # -----------------------------------------------------------------
         v_est = (v_right + v_left) / 2.0
         omega_est = (v_right - v_left) / self.wheel_base
 

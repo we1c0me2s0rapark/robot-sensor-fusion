@@ -22,6 +22,8 @@ No environmental effects such as collisions, friction variations, or slip are mo
 from __future__ import annotations
 import numpy as np
 
+from state import StateIdx, STATE_DIM
+
 
 class Robot:
     """
@@ -47,8 +49,12 @@ class Robot:
         @param y Initial y position in metres
         @param theta Initial heading in radians
         """
-        # True state vector: [x, y, theta, v, omega]
-        self._state = np.array([x, y, theta, 0.0, 0.0], dtype=np.float64)
+        self._state = np.zeros(STATE_DIM, dtype=np.float64)
+        self._state[StateIdx.PX] = x
+        self._state[StateIdx.PY] = y
+        self._state[StateIdx.THETA] = theta
+        self._state[StateIdx.V] = 0.0
+        self._state[StateIdx.OMEGA] = 0.0
 
     # ---------------------------------------------------------------------
     # State accessors
@@ -57,27 +63,27 @@ class Robot:
     @property
     def x(self) -> float:
         """@brief Current x position in metres."""
-        return float(self._state[0])
+        return float(self._state[StateIdx.PX])
 
     @property
     def y(self) -> float:
         """@brief Current y position in metres."""
-        return float(self._state[1])
+        return float(self._state[StateIdx.PY])
 
     @property
     def theta(self) -> float:
         """@brief Current heading in radians."""
-        return float(self._state[2])
+        return float(self._state[StateIdx.THETA])
 
     @property
     def v(self) -> float:
         """@brief Current linear velocity in m/s."""
-        return float(self._state[3])
+        return float(self._state[StateIdx.V])
 
     @property
     def omega(self) -> float:
         """@brief Current angular velocity in rad/s."""
-        return float(self._state[4])
+        return float(self._state[StateIdx.OMEGA])
 
     @property
     def state(self) -> np.ndarray:
@@ -99,8 +105,8 @@ class Robot:
         @param v Linear velocity in m/s
         @param omega Angular velocity in rad/s
         """
-        self._state[3] = v
-        self._state[4] = omega
+        self._state[StateIdx.V] = v
+        self._state[StateIdx.OMEGA] = omega
 
     def step(self, dt: float) -> None:
         """
@@ -116,12 +122,31 @@ class Robot:
         x, y, theta, v, omega = self._state
 
         if abs(omega) < 1e-9:
-            # Straight-line motion (unicycle model limit as angular velocity approaches zero)
+            # Degenerate case: straight-line motion.
+            #
+            # As omega approaches zero, the arc radius r = v / omega diverges.
+            # Falls back to direct integration to avoid division by zero.
             x += v * dt * np.cos(theta)
             y += v * dt * np.sin(theta)
         else:
-            # Exact unicycle integration assuming constant linear and angular velocity over dt
-            r = v / omega
+            # Exact arc integration for the unicycle model under constant linear and angular velocity.
+            #
+            # The robot moves along a circular trajectory with radius:
+            #   r = v / omega
+            #
+            # The instantaneous centre of curvature is fixed in the robot frame at a distance r
+            # perpendicular to the current heading direction. The side (left or right) depends on
+            # the sign of omega.
+            #
+            # The motion can be interpreted as a rotation about this centre of curvature, leading to
+            # an exact closed-form update of the position over the interval dt:
+            #
+            #   x_new = x + r * (sin(theta + omega * dt) - sin(theta))
+            #   y_new = y + r * (cos(theta) - cos(theta + omega * dt))
+            #
+            # This solution is exact under the assumption that linear and angular velocity remain
+            # constant over dt, and it avoids numerical error associated with Euler integration.
+            r = v / omega # radius of curvature of the arc
             x += r * (np.sin(theta + omega * dt) - np.sin(theta))
             y += r * (np.cos(theta) - np.cos(theta + omega * dt))
 
@@ -130,6 +155,6 @@ class Robot:
         # Normalise angle to [-pi, pi)
         theta = (theta + np.pi) % (2 * np.pi) - np.pi
 
-        self._state[0] = x
-        self._state[1] = y
-        self._state[2] = theta
+        self._state[StateIdx.PX] = x
+        self._state[StateIdx.PY] = y
+        self._state[StateIdx.THETA] = theta
